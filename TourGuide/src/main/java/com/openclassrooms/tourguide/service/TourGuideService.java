@@ -1,20 +1,17 @@
 package com.openclassrooms.tourguide.service;
 
 import com.openclassrooms.tourguide.helper.InternalTestHelper;
+import com.openclassrooms.tourguide.model.attraction.AttractionInfo;
 import com.openclassrooms.tourguide.tracker.Tracker;
-import com.openclassrooms.tourguide.user.User;
-import com.openclassrooms.tourguide.user.UserReward;
+import com.openclassrooms.tourguide.model.user.User;
+import com.openclassrooms.tourguide.model.user.UserReward;
 
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Random;
-import java.util.UUID;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -38,11 +35,14 @@ public class TourGuideService {
 	private final TripPricer tripPricer = new TripPricer();
 	public final Tracker tracker;
 	boolean testMode = true;
+	private final List<Attraction> attractions;
+	ExecutorService executorService = Executors.newFixedThreadPool(1000);
 
 	public TourGuideService(GpsUtil gpsUtil, RewardsService rewardsService) {
 		this.gpsUtil = gpsUtil;
 		this.rewardsService = rewardsService;
-		
+		this.attractions = gpsUtil.getAttractions();
+
 		Locale.setDefault(Locale.US);
 
 		if (testMode) {
@@ -61,7 +61,7 @@ public class TourGuideService {
 
 	public VisitedLocation getUserLocation(User user) {
 		VisitedLocation visitedLocation = (user.getVisitedLocations().size() > 0) ? user.getLastVisitedLocation()
-				: trackUserLocation(user);
+				: trackUserLocation(user).join();
 		return visitedLocation;
 	}
 
@@ -88,22 +88,38 @@ public class TourGuideService {
 		return providers;
 	}
 
-	public VisitedLocation trackUserLocation(User user) {
-		VisitedLocation visitedLocation = gpsUtil.getUserLocation(user.getUserId());
-		user.addToVisitedLocations(visitedLocation);
-		rewardsService.calculateRewards(user);
-		return visitedLocation;
+	public CompletableFuture<VisitedLocation> trackUserLocation(User user) {
+		return CompletableFuture.supplyAsync(() ->
+						gpsUtil.getUserLocation(user.getUserId()), executorService)
+				.thenApply(visitedLocation -> {
+					user.addToVisitedLocations(visitedLocation);
+					rewardsService.calculateRewards(user).join();
+					return visitedLocation;
+				});
 	}
 
 	public List<Attraction> getNearByAttractions(VisitedLocation visitedLocation) {
-		List<Attraction> nearbyAttractions = new ArrayList<>();
-		for (Attraction attraction : gpsUtil.getAttractions()) {
-			if (rewardsService.isWithinAttractionProximity(attraction, visitedLocation.location)) {
-				nearbyAttractions.add(attraction);
+		Map<Attraction, Double> attractionDistance = new HashMap<>();
+
+		for (Attraction attraction : attractions) {
+			{
+				double distanceFromAttraction = rewardsService.getDistance(attraction, visitedLocation.location);
+				attractionDistance.put(attraction, distanceFromAttraction);
 			}
 		}
 
-		return nearbyAttractions;
+		//Solution de tri.
+		Map<Attraction, Double> sortedAttractionDistance = attractionDistance.entrySet()
+				.stream()
+				.sorted(Map.Entry.comparingByValue())
+				.collect(Collectors.toMap(
+						Map.Entry::getKey,
+						Map.Entry::getValue,
+						(oldValue, newValue) -> oldValue, LinkedHashMap::new));
+
+		//récupération des 5 valeurs les plus petites(= les plus proches).
+		List<Attraction> ListAttractionsByDistance = sortedAttractionDistance.keySet().stream().limit(5).collect(Collectors.toList());
+		return ListAttractionsByDistance;
 	}
 
 	private void addShutDownHook() {
@@ -114,10 +130,21 @@ public class TourGuideService {
 		});
 	}
 
+	public AttractionInfo attractionInfoBuilder(Attraction attraction, User user) {
+
+		String attractionName = attraction.attractionName;
+		Location attractionLocation = new Location(attraction.latitude, attraction.longitude);
+		Location userLocation = getUserLocation(user).location;
+		double distanceInMiles = rewardsService.getDistance(attractionLocation, userLocation);
+		int rewardPoint = rewardsService.getRewardPoints(attraction, user);
+
+		return new AttractionInfo(attractionName, attractionLocation, distanceInMiles, rewardPoint);
+	}
+
 	/**********************************************************************************
-	 * 
+	 *
 	 * Methods Below: For Internal Testing
-	 * 
+	 *
 	 **********************************************************************************/
 	private static final String tripPricerApiKey = "test-server-api-key";
 	// Database connection will be used for external users, but for testing purposes
